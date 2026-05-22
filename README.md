@@ -78,15 +78,47 @@ kubectl delete -f k8s-kafka.yaml
 
 ## Пример выводимого сообщения 
 ```bash
-2026/05/22 06:25:23 [DLQ Middleware] Эвакуация сообщения 062522 в отстойник из-за ошибки: ошибка валидации: поврежденный JSON
-2026/05/22 06:25:23 [DLQ] КРИТИЧЕСКАЯ ОШИБКА записи в DLQ: ошибка отправки в kafka: [3] Unknown Topic Or Partition: the request is for a topic or partition that does not exist on this broker
-2026/05/22 06:25:23 [Воркер 1] Ошибка обработки сообщения: ошибка валидации: поврежденный JSON
-2026/05/22 06:25:26 [Бизнес-Логика] Данные успешно сохранены в Postgres. Ключ=062525
-2026/05/22 06:25:29 [Бизнес-Логика] Данные успешно сохранены в Postgres. Ключ=062528
-2026/05/22 06:25:32 [DLQ Middleware] Эвакуация сообщения 062531 в отстойник из-за ошибки: ошибка валидации: поврежденный JSON
-2026/05/22 06:25:32 [DLQ] КРИТИЧЕСКАЯ ОШИБКА записи в DLQ: ошибка отправки в kafka: [3] Unknown Topic Or Partition: the request is for a topic or partition that does not exist on this broker
-2026/05/22 06:25:32 [Воркер 1] Ошибка обработки сообщения: ошибка валидации: поврежденный JSON
-2026/05/22 06:25:35 [Бизнес-Логика] Данные успешно сохранены в Postgres. Ключ=062534
-2026/05/22 06:25:38 [Бизнес-Логика] Данные успешно сохранены в Postgres. Ключ=062537
+ROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
+2026/05/22 09:12:33 [Роутер] Временная ошибка. Отправка 090616 в Retry-топик (Попытка 1/3). Задержка: 2s
+2026/05/22 09:12:33 [Основной-Воркер-2] Ошибка сообщения 090613: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
+2026/05/22 09:12:33 [Роутер] Временная ошибка. Отправка 090613 в Retry-топик (Попытка 1/3). Задержка: 2s
+2026/05/22 09:12:36 [Основной-Воркер-1] Ошибка сообщения 090619: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
+2026/05/22 09:12:36 [Роутер] Временная ошибка. Отправка 090619 в Retry-топик (Попытка 1/3). Задержка: 2s
+2026/05/22 09:12:36 [Основной-Воркер-2] Ошибка сообщения 090622: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
+2026/05/22 09:12:36 [Роутер] Временная ошибка. Отправка 090622 в Retry-топик (Попытка 1/3). Задержка: 2s
+2026/05/22 09:12:39 [Основной-Воркер-1] Ошибка сообщения 090625: unrecoverable validation error (e.g. bad JSON): bad JSON structure
+2026/05/22 09:12:39 [Роутер] Фатальный сбой. Отправка 090625 в DLQ
+2026/05/22 09:12:39 [Основной-Воркер-2] Ошибка сообщения 090628: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
+2026/05/22 09:12:39 [Роутер] Временная ошибка. Отправка 090628 в Retry-топик (Попытка 1/3). Задержка: 2s
+2026/05/22 09:12:39 [Retry-Воркер-2] Ошибка сообщения 090616: transient infrastructure error (e.g. DB timeout): database connection timeout
+2026/05/22 09:12:39 [Роутер] Временная ошибка. Отправка 090616 в Retry-топик (Попытка 2/3). Задержка: 4s
+2026/05/22 09:12:39 [Retry-Воркер-1] Ошибка сообщения 090613: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
+2026/05/22 09:12:39 [Роутер] Временная ошибка. Отправка 090613 в Retry-топик (Попытка 2/3). Задержка: 4s
+2026/05/22 09:12:40 [Основной-Воркер-1] Ошибка сообщения 090631: transient infrastructure error (e.g. DB time
+```
+## Быстрый запуск
+```bash
+# 1. Переключаем терминал на Docker внутри Minikube
+eval $(minikube docker-env)
 
+# 2. Собираем свежий Docker-образ приложения
+docker build -t kafka-pipeline-go:local .
+
+# 3. Применяем манифест (поднимутся PVC, СУБД, Kafka, ConfigMap и Go-приложение)
+kubectl apply -f k8s-kafka.yaml
+```
+
+## Логи 
+```bash
+kubectl logs -f deployment/go-kafka-app --container=app
+```
+
+## Перезапуск
+```bash
+eval $(minikube docker-env) && \
+docker build -t kafka-pipeline-go:local . && \
+kubectl rollout restart deployment/go-kafka-app && \
+echo "Ожидаем применение обновления..." && \
+sleep 15 && \
+kubectl logs -f deployment/go-kafka-app --container=app
 ```

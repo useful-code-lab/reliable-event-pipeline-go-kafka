@@ -4,14 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
-
-	mykafka "kafka-pipeline-go/internal/kafka"
 
 	// Регистрация драйвера pgx для database/sql
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -20,192 +21,254 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-func main() {
-	// 1. Инициализация конфигурации
-	kafkaBrokers := getEnv("KAFKA_BROKERS", "kafka-service:9092")
-	cfg := mykafka.Config{
-		Brokers: []string{kafkaBrokers},
-		Topic:   getEnv("KAFKA_TOPIC", "local-events"),
-		GroupID: getEnv("KAFKA_GROUP_ID", "local-processor-group"),
-		UseTLS:  false,
-	}
-	dlqCfg := mykafka.Config{
-		Brokers: cfg.Brokers,
-		Topic:   getEnv("KAFKA_DLQ_TOPIC", "local-events-dlq"),
-		UseTLS:  cfg.UseTLS,
-	}
+var (
+	ErrFatalValidation  = errors.New("unrecoverable validation error (e.g. bad JSON)")
+	ErrTransientNetwork = errors.New("transient infrastructure error (e.g. DB timeout)")
+)
 
+func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 2. Отказоустойчивое подключение к PostgreSQL через pgx драйвер (до 5 попыток)
+	brokers := []string{getEnv("KAFKA_BROKERS", "kafka-service:9092")}
+
+	mainTopic := getEnv("KAFKA_TOPIC", "local-events")
+	retryTopic := mainTopic + "-retry"
+	dlqTopic := mainTopic + "-dlq"
+	groupID := getEnv("KAFKA_GROUP_ID", "local-processor-group")
+
+	// --- ПАТТЕРН 1: Управление топологией ---
+	log.Println("[Kafka] Инициализация топиков...")
+	// Передаем brokers[0] (тип string) вместо brokers (тип []string)
+	if err := ensureKafkaTopics(brokers[0], mainTopic, retryTopic, dlqTopic); err != nil {
+		log.Fatalf("Ошибка создания топиков Kafka: %v", err)
+	}
+
+	// Инициализация PostgreSQL
 	var dbPool *sql.DB
-	var err error
+	var dbErr error
 	for i := 1; i <= 5; i++ {
-		log.Printf("Попытка подключения к PostgreSQL (%d/5)...", i)
-		dbPool, err = sql.Open("pgx", getEnv("DATABASE_URL", "postgres://user:password@localhost:5432/app_db?sslmode=disable"))
-		if err == nil {
-			// Проверяем, готова ли база принимать запросы
-			if err = dbPool.PingContext(ctx); err == nil {
-				log.Println("Успешно подключено к PostgreSQL.")
-				break
-			}
-		}
-		if i == 5 {
-			log.Fatalf("Не удалось подключиться к PostgreSQL после 5 попыток: %v", err)
-		}
-		time.Sleep(3 * time.Second) // Даем время СУБД на инициализацию
-	}
-	defer dbPool.Close()
-
-	// Инициализация таблицы в БД
-	if err := initDatabaseSchema(dbPool); err != nil {
-		log.Fatalf("Ошибка инициализации БД: %v", err)
-	}
-
-	// 3. Отказоустойчивое подключение к Redis (до 5 попыток)
-	var rdb *redis.Client
-	for i := 1; i <= 5; i++ {
-		log.Printf("Попытка подключения к Redis (%d/5)...", i)
-		rdb = redis.NewClient(&redis.Options{
-			Addr: getEnv("REDIS_URL", "localhost:6379"),
-		})
-		if err = rdb.Ping(ctx).Err(); err == nil {
-			log.Println("Успешно подключено к Redis.")
+		dbPool, dbErr = sql.Open("pgx", getEnv("DATABASE_URL", "postgres://user:password@postgres-service:5432/app_db?sslmode=disable"))
+		if dbErr == nil && dbPool.PingContext(ctx) == nil {
+			log.Println("Успешно подключено к PostgreSQL.")
 			break
 		}
-		if i == 5 {
-			log.Fatalf("Не удалось подключиться к Redis после 5 попыток: %v", err)
+		if dbPool != nil {
+			dbPool.Close()
 		}
 		time.Sleep(2 * time.Second)
 	}
+	if dbErr != nil {
+		log.Fatalf("Postgres недоступен: %v", dbErr)
+	}
+	defer dbPool.Close()
+	_ = initDatabaseSchema(dbPool)
+
+	// Инициализация Redis
+	rdb := redis.NewClient(&redis.Options{Addr: getEnv("REDIS_URL", "redis-service:6379")})
 	defer rdb.Close()
 
-	// 4. Инициализация компонентов Kafka
-	producer := mykafka.NewProducer(cfg)
-	dlqProducer := mykafka.NewProducer(dlqCfg)
-	consumer := mykafka.NewConsumer(cfg)
+	// --- Исправленная конфигурация Продюсеров с автоматическими ретраями ---
+	retryProducer := &kafka.Writer{
+		Addr:         kafka.TCP(brokers...),
+		Balancer:     &kafka.LeastBytes{},
+		RequiredAcks: kafka.RequireOne,
+		MaxAttempts:  5, // Количество автоматических попыток при ошибках метаданных (Unknown Topic)
+	}
 
-	defer func() {
-		_ = producer.Close()
-		_ = dlqProducer.Close()
-		_ = consumer.Close()
-		log.Println("Соединения с Kafka успешно закрыты.")
-	}()
+	dlqProducer := &kafka.Writer{
+		Addr:         kafka.TCP(brokers...),
+		Balancer:     &kafka.LeastBytes{},
+		RequiredAcks: kafka.RequireOne,
+		MaxAttempts:  5,
+	}
+
+	// Метод Close() у них вызывается точно так же, код defer менять не нужно!
+	defer retryProducer.Close()
+	defer dlqProducer.Close()
+
+	// --- НАСТРОЙКА КОНСЬЮМЕРОВ ---
+	// Главный читатель (Основной поток)
+	mainReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: brokers, GroupID: groupID, Topic: mainTopic, MinBytes: 10e3, MaxBytes: 10e6,
+	})
+	defer mainReader.Close()
+
+	// Читатель ретраев (Фоновый поток повторных попыток)
+	retryReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: brokers, GroupID: groupID + "-retry", Topic: retryTopic, MinBytes: 10e3, MaxBytes: 10e6,
+	})
+	defer retryReader.Close()
 
 	var messageCounter int
 	var counterMu sync.Mutex
 
-	// 5. Описание бизнес-логики (Handler) с интеграцией Postgres и Redis
-	eventHandler := func(ctx context.Context, msg kafka.Message) error {
+	// Функция бизнес-обработки
+	executeBusinessLogic := func(ctx context.Context, msg kafka.Message) error {
 		messageID := string(msg.Key)
+		redisKey := "processed_msg:" + messageID
 
-		// --- ШАГ А: Дедупликация через Redis (Идемпотентность) ---
-		isNew, err := rdb.SetNX(ctx, "processed_msg:"+messageID, true, 24*time.Hour).Result()
+		// Идемпотентность через Redis
+		isNew, err := rdb.SetNX(ctx, redisKey, true, 24*time.Hour).Result()
 		if err != nil {
-			log.Printf("[Redis] Ошибка проверки кэша: %v. Пропускаем дедупликацию ради надежности.", err)
+			log.Printf("[Redis] Ошибка сети: %v. Полагаемся на UNIQUE в БД.", err)
 		} else if !isNew {
-			log.Printf("[Идемпотентность/Redis] Сообщение %s уже обрабатывалось ранее. Пропускаем дубликат.", messageID)
+			log.Printf("[Идемпотентность] Сообщение %s уже обрабатывалось. Пропуск.", messageID)
 			return nil
 		}
 
-		// Имитация случайных ошибок бизнес-логики для демонстрации DLQ
+		// Имитация случайных ошибок для тестов роутинга
 		counterMu.Lock()
 		messageCounter++
-		isErrorIteration := messageCounter%3 == 0
+		currentCount := messageCounter
 		counterMu.Unlock()
 
-		if isErrorIteration {
-			_ = rdb.Del(ctx, "processed_msg:"+messageID).Err()
-			return errors.New("ошибка валидации: поврежденный JSON")
+		if currentCount%5 == 0 {
+			_ = rdb.Del(ctx, redisKey).Err()
+			return fmt.Errorf("%w: bad JSON structure", ErrFatalValidation)
+		}
+		if currentCount%7 == 0 {
+			_ = rdb.Del(ctx, redisKey).Err()
+			return fmt.Errorf("%w: database connection timeout", ErrTransientNetwork)
 		}
 
-		// --- ШАГ Б: Запись бизнес-данных в PostgreSQL в транзакции ---
-		tx, err := dbPool.BeginTx(ctx, nil)
+		// Запись в базу данных
+		query := `INSERT INTO events (msg_key, msg_value, processed_at) VALUES ($1, $2, $3) ON CONFLICT (msg_key) DO NOTHING RETURNING id;`
+		var insertedID int64
+		err = dbPool.QueryRowContext(ctx, query, messageID, string(msg.Value), time.Now()).Scan(&insertedID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
 		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-
-		_, err = tx.ExecContext(ctx, "INSERT INTO events (msg_key, msg_value, processed_at) VALUES ($1, $2, $3)", messageID, string(msg.Value), time.Now())
-		if err != nil {
-			_ = rdb.Del(ctx, "processed_msg:"+messageID).Err()
-			return err
+			_ = rdb.Del(ctx, redisKey).Err()
+			return fmt.Errorf("%w: db fail: %v", ErrTransientNetwork, err)
 		}
 
-		if err := tx.Commit(); err != nil {
-			_ = rdb.Del(ctx, "processed_msg:"+messageID).Err()
-			return err
-		}
-
-		log.Printf("[Бизнес-Логика] Данные успешно сохранены в Postgres. Ключ=%s", messageID)
+		log.Printf("[Бизнес-Логика] Успешно обработано сообщение Key=%s", messageID)
 		return nil
 	}
 
-	// Запуск пула консьюмеров с Middleware DLQ
-	log.Println("Запуск пайплайна [Kafka + Postgres + Redis]...")
-	go consumer.Start(ctx, 3, WithDLQ(dlqProducer, eventHandler))
+	// Универсальный обработчик сообщений с роутером ошибок (Паттерны 3 и 4)
+	processMessageRouter := func(workerTag string, reader *kafka.Reader, msg kafka.Message) {
+		procErr := executeBusinessLogic(ctx, msg)
 
-	// Имитация генератора событий (Отправка уникальных ключей на базе таймстемпа)
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				uniqueKey := time.Now().Format("150405") // Генерация уникального ID (ЧЧММСС)
-				err := producer.SendMessage(ctx, []byte(uniqueKey), []byte("user_click_action"))
-				if err != nil {
-					log.Printf("Ошибка отправки: %v", err)
+		if procErr != nil {
+			log.Printf("[%s] Ошибка сообщения %s: %v", workerTag, string(msg.Key), procErr)
+
+			// Ошибка фатальная? -> Сразу в DLQ
+			if errors.Is(procErr, ErrFatalValidation) {
+				log.Printf("[Роутер] Фатальный сбой. Отправка %s в DLQ", string(msg.Key))
+				_ = sendToKafkaTopic(ctx, dlqProducer, dlqTopic, msg)
+			} else {
+				// Ошибка временная -> Паттерн 2 (Non-blocking Retry)
+				attempts := getRetryAttempts(msg) + 1
+				if attempts > 3 {
+					log.Printf("[Роутер] Превышен лимит ретраев (3/3) для %s. Перенос в DLQ.", string(msg.Key))
+					_ = sendToKafkaTopic(ctx, dlqProducer, dlqTopic, msg)
+				} else {
+					// Экспоненциальная задержка Backoff перед отправкой в топик ретраев [1]
+					backoffDuration := time.Duration(attempts) * 2 * time.Second
+					log.Printf("[Роутер] Временная ошибка. Отправка %s в Retry-топик (Попытка %d/3). Задержка: %v", string(msg.Key), attempts, backoffDuration)
+
+					time.Sleep(backoffDuration)
+					msg.Headers = append(msg.Headers, kafka.Header{Key: "x-retry-attempts", Value: []byte(strconv.Itoa(attempts))})
+					_ = sendToKafkaTopic(ctx, retryProducer, retryTopic, msg)
 				}
 			}
 		}
-	}()
 
+		// Паттерн 4: Ручной коммит офсета только после успешного сохранения ИЛИ успешного ретрая/DLQ
+		if err := reader.CommitMessages(ctx, msg); err != nil {
+			log.Printf("[Критическая ошибка] Не удалось закоммитить офсет: %v", err)
+		}
+	}
+
+	// --- ЗАПУСК ПОТОКОВ ОБРАБОТКИ ---
+
+	// Воркеры для Основного Топика
+	for w := 1; w <= 2; w++ {
+		go func(id int) {
+			tag := fmt.Sprintf("Основной-Воркер-%d", id)
+			for {
+				msg, err := mainReader.FetchMessage(ctx)
+				if err != nil {
+					return
+				}
+				processMessageRouter(tag, mainReader, msg)
+			}
+		}(w)
+	}
+
+	// --- ИСПРАВЛЕННЫЙ ПАТТЕРН 2: Воркеры для Топика Повторов (Retry) ---
+	// Они читают сообщения из local-events-retry и пытаются обработать их снова [1]
+	for w := 1; w <= 2; w++ {
+		go func(id int) {
+			tag := fmt.Sprintf("Retry-Воркер-%d", id)
+			for {
+				msg, err := retryReader.FetchMessage(ctx)
+				if err != nil {
+					return
+				}
+				processMessageRouter(tag, retryReader, msg)
+			}
+		}(w)
+	}
+
+	log.Println("[Пайплайн] Все консьюмеры (Основной + Retry) успешно запущены.")
 	<-ctx.Done()
 	log.Println("Завершение работы приложения...")
-	time.Sleep(1 * time.Second)
+}
+
+// Вспомогательные функции остаются без изменений
+func ensureKafkaTopics(brokerAddr string, topics ...string) error {
+	conn, err := kafka.Dial("tcp", brokerAddr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	controller, err := conn.Controller()
+	if err != nil {
+		return err
+	}
+	cConn, err := kafka.Dial("tcp", net.JoinHostPort(controller.Host, strconv.Itoa(controller.Port)))
+	if err != nil {
+		return err
+	}
+	defer cConn.Close()
+	var tConfigs []kafka.TopicConfig
+	for _, t := range topics {
+		p := 3
+		if t != topics[0] {
+			p = 1
+		}
+		tConfigs = append(tConfigs, kafka.TopicConfig{Topic: t, NumPartitions: p, ReplicationFactor: 1})
+	}
+	_ = cConn.CreateTopics(tConfigs...)
+	return nil
+}
+
+func sendToKafkaTopic(ctx context.Context, writer *kafka.Writer, topic string, msg kafka.Message) error {
+	return writer.WriteMessages(ctx, kafka.Message{Topic: topic, Key: msg.Key, Value: msg.Value, Headers: msg.Headers})
+}
+
+func getRetryAttempts(msg kafka.Message) int {
+	for _, h := range msg.Headers {
+		if h.Key == "x-retry-attempts" {
+			v, _ := strconv.Atoi(string(h.Value))
+			return v
+		}
+	}
+	return 0
 }
 
 func initDatabaseSchema(db *sql.DB) error {
-	query := `
-	CREATE TABLE IF NOT EXISTS events (
-		id SERIAL PRIMARY KEY,
-		msg_key VARCHAR(50) NOT NULL,
-		msg_value TEXT NOT NULL,
-		processed_at TIMESTAMP NOT NULL
-	);`
-	_, err := db.Exec(query)
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS events (id BIGSERIAL PRIMARY KEY, msg_key VARCHAR(50) NOT NULL UNIQUE, msg_value TEXT NOT NULL, processed_at TIMESTAMP NOT NULL);`)
 	return err
 }
 
 func getEnv(key, fallback string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
+	if v, exists := os.LookupEnv(key); exists {
+		return v
 	}
 	return fallback
-}
-
-func WithDLQ(dlqProducer *mykafka.Producer, next mykafka.MessageHandler) mykafka.MessageHandler {
-	return func(ctx context.Context, msg kafka.Message) error {
-		err := next(ctx, msg)
-		if err == nil {
-			return nil
-		}
-
-		log.Printf("[DLQ Middleware] Эвакуация сообщения %s в отстойник из-за ошибки: %v", string(msg.Key), err)
-
-		dlqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if dlqErr := dlqProducer.SendMessage(dlqCtx, msg.Key, msg.Value); dlqErr != nil {
-			log.Printf("[DLQ] КРИТИЧЕСКАЯ ОШИБКА записи в DLQ: %v", dlqErr)
-			return err
-		}
-
-		log.Println("[DLQ] Сообщение успешно изолировано.")
-		return nil
-	}
 }
