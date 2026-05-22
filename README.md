@@ -1,128 +1,273 @@
 # kafka-pipeline-go
 
-Отказоустойчивый пайплайн интеграции с Apache Kafka, PostgreSQL и Redis на языке Go, оптимизированный для работы в Kubernetes (Minikube).
+Отказоустойчивый пайплайн обработки событий на **Go + Apache Kafka + PostgreSQL + Redis**, предназначенный для работы в **Kubernetes (Minikube)**.
 
-## Архитектура и паттерны
-- **Гарантия доставки (Exactly-Once Semantics через БД)**: Комбинация паттерна *Идемпотентный потребитель* (с использованием уникального индекса `UNIQUE` в PostgreSQL) и распределенного кэша в Redis (паттерн *Проверка и установка* через `SETNX`).
-- **Cloud-Native Probes**: Нативные проверки здоровья компонентов (`livenessProbe` и `readinessProbe`), заменяющие нестабильные скрипты инициализации.
-- **Плавное завершение (Graceful Shutdown)**: На уровне Go и Kubernetes (`terminationGracePeriodSeconds`). При обновлении деплоя воркеры корректно дописывают транзакции и коммитят офсеты.
-- **Изоляция ошибок (Dead Letter Queue)**: Паттерн *DLQ Middleware*. Сообщения, вызвавшие неустранимую ошибку бизнес-логики, автоматически эвакуируются в отдельный топик-отстойник.
-- **Безопасный образ**: Сборка по паттерну *Distroless (Multi-Stage)*. Финальный контейнер не содержит командной оболочки (`sh`/`bash`) и запускается от имени не-привилегированного пользователя (`non-root`).
+Проект демонстрирует реализацию паттернов распределённой обработки данных: **Exactly-Once Processing**, **Transactional Outbox**, **Retry Queue**, **Dead Letter Queue (DLQ)** и **Graceful Shutdown**.
 
-## Требования
-- Go 1.25+
-- Minikube
-- kubectl
+---
 
-## Инструкция по запуску в Minikube
+## Возможности
 
-### 1. Запуск и настройка кластера
-Выделите кластеру достаточно ресурсов для работы брокера Kafka и СУБД:
+* Обработка событий через Apache Kafka
+* Идемпотентная запись в PostgreSQL
+* Кэширование обработанных сообщений через Redis
+* Повторная обработка временных ошибок (Retry Topic)
+* Изоляция невалидных сообщений (DLQ)
+* Автоматическое восстановление после отказов
+* Работа внутри Kubernetes
+* Безопасный контейнер (Distroless + non-root)
+
+---
+
+## Архитектура
+
+```text
+Producer
+   │
+   ▼
+┌───────────────────┐
+│ local-events      │
+│ (Kafka Topic)     │
+└────────┬──────────┘
+         │
+         ▼
+┌─────────────────────────┐
+│ Go Consumers (Workers)  │
+└────────┬────────────────┘
+         │
+         │
+ ┌───────┴─────────────┐
+ │                     │
+ ▼                     ▼
+Успех              Ошибка
+ │                     │
+ ▼                     ▼
+PostgreSQL       Transactional
+(events)            Outbox
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+   Retry Topic              DLQ Topic
+(local-events-retry)   (local-events-dlq)
+```
+
+---
+
+## Используемые паттерны
+
+### 1. Exactly-Once Processing
+
+Реализован через комбинацию:
+
+* **Redis SETNX** — быстрая проверка дубликатов;
+* **UNIQUE(msg_key)** — окончательная гарантия уникальности в PostgreSQL.
+
+Пример:
+
+```sql
+INSERT INTO events (...)
+ON CONFLICT (msg_key)
+DO NOTHING;
+```
+
+---
+
+### 2. Transactional Outbox
+
+Ошибочные сообщения сначала сохраняются в таблицу:
+
+```text
+kafka_outbox
+```
+
+После успешной отправки в Kafka запись удаляется.
+
+Это устраняет потерю данных при аварийном завершении приложения.
+
+---
+
+### 3. Retry Queue
+
+Для временных ошибок:
+
+```text
+local-events
+    ↓
+local-events-retry
+```
+
+Поддерживается до **3 попыток** повторной обработки.
+
+---
+
+### 4. Dead Letter Queue (DLQ)
+
+Для неустранимых ошибок:
+
+```text
+local-events-dlq
+```
+
+Пример причины:
+
+```text
+bad JSON structure
+```
+
+---
+
+### 5. Graceful Shutdown
+
+При завершении:
+
+* останавливается чтение Kafka;
+* завершаются транзакции;
+* коммитятся офсеты;
+* контейнер завершается корректно.
+
+---
+
+# Структура проекта
+
+```text
+.
+├── main.go
+├── Dockerfile
+├── k8s-kafka.yaml
+├── README.md
+└── docs/
+```
+
+---
+
+# Требования
+
+```text
+Go 1.25+
+Docker
+Minikube
+kubectl
+```
+
+---
+
+# Запуск в Minikube
+
+## 1. Запуск кластера
+
 ```bash
 minikube start --cpus=3 --memory=4096
 ```
 
-### 2. Переключение контекста Docker на Minikube
-Обязательно выполните эту команду в терминале перед сборкой, чтобы образ сохранился внутри локального реестра Minikube:
+## 2. Подключение Docker
+
 ```bash
 eval $(minikube docker-env)
 ```
 
-### 3. Сборка безопасного Docker-образа приложения
+## 3. Сборка образа
+
 ```bash
 docker build -t kafka-pipeline-go:local .
 ```
 
-### 4. Развертывание инфраструктуры и дисков
-Примените манифест. Kubernetes автоматически создаст постоянные диски (`PersistentVolumeClaim`) для персистентного хранения данных Postgres и Kafka:
+## 4. Развёртывание инфраструктуры
+
 ```bash
 kubectl apply -f k8s-kafka.yaml
 ```
 
-### 5. Инициализация топиков в Kafka (Критически важно!)
-Поскольку в промышленной конфигурации автосоздание топиков отключено, их необходимо создать вручную до начала активной работы Go-приложения. 
+---
 
-Подождите 10-15 секунд, пока под `kafka-deployment` перейдет в статус `Running`, и выполните:
+## 5. Создание Kafka топиков
+
 ```bash
-# Создание основного бизнес-топика с 3 партициями для параллельной обработки
-kubectl exec -it deployment/kafka-deployment -- kafka-topics.sh --create --topic local-events --bootstrap-server localhost:9092 --partitions 3 --replication-factor 1
-
-# Создание топика для аварийных сообщений (DLQ)
-kubectl exec -it deployment/kafka-deployment -- kafka-topics.sh --create --topic local-events-dlq --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+kubectl exec -it deployment/kafka-deployment \
+-- kafka-topics.sh \
+--create \
+--topic local-events \
+--bootstrap-server localhost:9092 \
+--partitions 3 \
+--replication-factor 1
 ```
 
-### 6. Перезапуск Go-приложения
-Если Go-приложение запустилось раньше, чем вы создали топики брокера, принудительно перезапустите его поды, чтобы они переподключились к чистой структуре:
+DLQ:
+
+```bash
+kubectl exec -it deployment/kafka-deployment \
+-- kafka-topics.sh \
+--create \
+--topic local-events-dlq \
+--bootstrap-server localhost:9092 \
+--partitions 1 \
+--replication-factor 1
+```
+
+---
+
+## 6. Перезапуск приложения
+
 ```bash
 kubectl rollout restart deployment/go-kafka-app
 ```
 
-### 7. Мониторинг пайплайна
-Проверьте, что все поды успешно перешли в статус `Running`:
+---
+
+# Мониторинг
+
+Статус подов:
+
 ```bash
 kubectl get pods -w
 ```
 
-Смотрите логи работы распределенного пула воркеров:
+Логи:
+
 ```bash
-kubectl logs -f deployment/go-kafka-app --all-containers=true
+kubectl logs -f deployment/go-kafka-app --container=app
 ```
 
-## Очистка ресурсов
-Чтобы полностью удалить все развернутые поды, сервисы и освободить постоянные диски:
+---
+
+# Пример работы
+
+```text
+[Бизнес-Логика] Успешно обработано сообщение Key=093217
+
+[Outbox]
+Временная ошибка → Retry
+
+[Outbox-Worker]
+Перенесено → local-events-retry
+
+[Retry-Воркер]
+Повторная обработка успешна
+
+[Outbox]
+Фатальная ошибка → DLQ
+```
+
+---
+
+# Очистка
+
+Удаление инфраструктуры:
+
 ```bash
 kubectl delete -f k8s-kafka.yaml
 ```
 
+---
 
+## Технические особенности реализации
 
-## Пример выводимого сообщения 
-```bash
-2026/05/22 09:32:14 [Kafka] Инициализация топиков...
-2026/05/22 09:32:14 Успешно подключено к PostgreSQL.
-2026/05/22 09:32:14 [Пайплайн] Все консьюмеры (Основной + Retry) успешно запущены.
-2026/05/22 09:32:31 [Бизнес-Логика] Успешно обработано сообщение Key=093217
-2026/05/22 09:32:31 [Бизнес-Логика] Успешно обработано сообщение Key=093223
-2026/05/22 09:32:31 [Бизнес-Логика] Успешно обработано сообщение Key=093226
-2026/05/22 09:32:31 [Бизнес-Логика] Успешно обработано сообщение Key=093220
-2026/05/22 09:32:31 [Основной-Воркер-2] Ошибка сообщения 093229: unrecoverable validation error (e.g. bad JSON): bad JSON structure
-2026/05/22 09:32:31 [Outbox] Фатальная ошибка. Регистрация 093229 в Outbox -> DLQ
-2026/05/22 09:32:33 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=093229 -> Топик=local-events-dlq
-2026/05/22 09:32:40 [Основной-Воркер-1] Ошибка сообщения 093232: transient infrastructure error (e.g. DB timeout): database connection timeout
-2026/05/22 09:32:40 [Outbox] Временная ошибка. Регистрация 093232 в Outbox -> Retry (Попытка 1)
-2026/05/22 09:32:40 [Бизнес-Логика] Успешно обработано сообщение Key=093235
-2026/05/22 09:32:40 [Бизнес-Логика] Успешно обработано сообщение Key=093238
-2026/05/22 09:32:42 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=093232 -> Топик=local-events-retry
-2026/05/22 09:32:45 [Бизнес-Логика] Успешно обработано сообщение Key=093232
-2026/05/22 09:32:49 [Основной-Воркер-1] Ошибка сообщения 093241: unrecoverable validation error (e.g. bad JSON): bad JSON structure
-2026/05/22 09:32:49 [Outbox] Фатальная ошибка. Регистрация 093241 в Outbox -> DLQ
-2026/05/22 09:32:49 [Бизнес-Логика] Успешно обработано сообщение Key=093244
-2026/05/22 09:32:49 [Бизнес-Логика] Успешно обработано сообщение Key=093247
-2026/05/22 09:32:51 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=093241 -> Топик=local-events-dlq
-```
-## Быстрый запуск
-```bash
-# 1. Переключаем терминал на Docker внутри Minikube
-eval $(minikube docker-env)
+| Компонент  | Назначение               |
+| ---------- | ------------------------ |
+| Kafka      | транспорт сообщений      |
+| PostgreSQL | идемпотентное хранилище  |
+| Redis      | дедупликация             |
+| Outbox     | гарантированная доставка |
+| Retry      | повторные попытки        |
+| DLQ        | изоляция ошибок          |
+| Kubernetes | оркестрация              |
 
-# 2. Собираем свежий Docker-образ приложения
-docker build -t kafka-pipeline-go:local .
-
-# 3. Применяем манифест (поднимутся PVC, СУБД, Kafka, ConfigMap и Go-приложение)
-kubectl apply -f k8s-kafka.yaml
-```
-
-## Логи 
-```bash
-kubectl logs -f deployment/go-kafka-app --container=app
-```
-
-## Перезапуск
-```bash
-eval $(minikube docker-env) && \
-docker build -t kafka-pipeline-go:local . && \
-kubectl rollout restart deployment/go-kafka-app && \
-echo "Ожидаем применение обновления..." && \
-sleep 15 && \
-kubectl logs -f deployment/go-kafka-app --container=app
-```
