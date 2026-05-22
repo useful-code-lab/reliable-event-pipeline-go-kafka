@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: kafka
-        image: apache/kafka:3.7.0 # Фиксированная версия с поддержкой KRaft
+        image: apache/kafka:3.7.0
         ports:
         - containerPort: 9092
         env:
@@ -28,7 +28,6 @@ spec:
           value: "1@localhost:9093"
         - name: KAFKA_LISTENERS
           value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
-        # Рекламируем имя сервиса kafka-service для других подов
         - name: KAFKA_ADVERTISED_LISTENERS
           value: "PLAINTEXT://kafka-service:9092"
         - name: KAFKA_CONTROLLER_LISTENER_NAMES
@@ -49,3 +48,29 @@ spec:
     - protocol: TCP
       port: 9092
       targetPort: 9092
+---
+# Добавляем сюда наше Go-приложение
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-kafka-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: go-kafka-app
+  template:
+    metadata:
+      labels:
+        app: go-kafka-app
+    spec:
+      # Ждем, пока Кафка начнет принимать сетевые соединения на порту 9092
+      initContainers:
+      - name: wait-for-kafka
+        image: busybox:latest
+        command: ['sh', '-c', 'until nc -zvw1 kafka-service 9092; do echo "Ожидание запуска Kafka..."; sleep 2; done;']
+      
+      containers:
+      - name: app
+        image: kafka-pipeline-go:local
+        imagePullPolicy: Never
