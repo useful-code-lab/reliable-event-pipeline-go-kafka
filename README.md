@@ -78,31 +78,27 @@ kubectl delete -f k8s-kafka.yaml
 
 ## Пример выводимого сообщения 
 ```bash
-2026/05/22 09:23:38 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091122 -> Топик=local-events-dlq
-2026/05/22 09:23:39 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091131 -> Топик=local-events-retry
-2026/05/22 09:23:40 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=090846 -> Топик=local-events-retry
-2026/05/22 09:23:41 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=090849 -> Топик=local-events-retry
-2026/05/22 09:23:42 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=090725 -> Топик=local-events-retry
-2026/05/22 09:23:43 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091149 -> Топик=local-events-dlq
-2026/05/22 09:23:44 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091152 -> Топик=local-events-retry
-2026/05/22 09:23:45 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091201 -> Топик=local-events-retry
-2026/05/22 09:23:45 [Retry-Воркер-1] Ошибка сообщения 091131: unrecoverable validation error (e.g. bad JSON): bad JSON structure
-2026/05/22 09:23:45 [Outbox] Фатальная ошибка. Регистрация 091131 в Outbox -> DLQ
-2026/05/22 09:23:45 [Retry-Воркер-2] Ошибка сообщения 090837: transient infrastructure error (e.g. DB timeout): database connection timeout
-2026/05/22 09:23:45 [Outbox] Временная ошибка. Регистрация 090837 в Outbox -> Retry (Попытка 1)
-2026/05/22 09:23:45 [Retry-Воркер-1] Ошибка сообщения 090846: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
-2026/05/22 09:23:45 [Outbox] Временная ошибка. Регистрация 090846 в Outbox -> Retry (Попытка 1)
-2026/05/22 09:23:45 [Retry-Воркер-2] Ошибка сообщения 090849: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
-2026/05/22 09:23:45 [Outbox] Временная ошибка. Регистрация 090849 в Outbox -> Retry (Попытка 1)
-2026/05/22 09:23:45 [Retry-Воркер-1] Ошибка сообщения 090725: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
-2026/05/22 09:23:45 [Outbox] Временная ошибка. Регистрация 090725 в Outbox -> Retry (Попытка 1)
-2026/05/22 09:23:45 [Retry-Воркер-2] Ошибка сообщения 091152: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
-2026/05/22 09:23:45 [Outbox] Временная ошибка. Регистрация 091152 в Outbox -> Retry (Попытка 1)
-2026/05/22 09:23:45 [Retry-Воркер-1] Ошибка сообщения 091201: unrecoverable validation error (e.g. bad JSON): bad JSON structure
-2026/05/22 09:23:45 [Outbox] Фатальная ошибка. Регистрация 091201 в Outbox -> DLQ
-2026/05/22 09:23:46 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=090858 -> Топик=local-events-retry
-2026/05/22 09:23:47 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091204 -> Топик=local-events-retry
-2026/05/22 09:23:48 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091210 -> Топик=local-events-dlq
+2026/05/22 09:32:14 [Kafka] Инициализация топиков...
+2026/05/22 09:32:14 Успешно подключено к PostgreSQL.
+2026/05/22 09:32:14 [Пайплайн] Все консьюмеры (Основной + Retry) успешно запущены.
+2026/05/22 09:32:31 [Бизнес-Логика] Успешно обработано сообщение Key=093217
+2026/05/22 09:32:31 [Бизнес-Логика] Успешно обработано сообщение Key=093223
+2026/05/22 09:32:31 [Бизнес-Логика] Успешно обработано сообщение Key=093226
+2026/05/22 09:32:31 [Бизнес-Логика] Успешно обработано сообщение Key=093220
+2026/05/22 09:32:31 [Основной-Воркер-2] Ошибка сообщения 093229: unrecoverable validation error (e.g. bad JSON): bad JSON structure
+2026/05/22 09:32:31 [Outbox] Фатальная ошибка. Регистрация 093229 в Outbox -> DLQ
+2026/05/22 09:32:33 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=093229 -> Топик=local-events-dlq
+2026/05/22 09:32:40 [Основной-Воркер-1] Ошибка сообщения 093232: transient infrastructure error (e.g. DB timeout): database connection timeout
+2026/05/22 09:32:40 [Outbox] Временная ошибка. Регистрация 093232 в Outbox -> Retry (Попытка 1)
+2026/05/22 09:32:40 [Бизнес-Логика] Успешно обработано сообщение Key=093235
+2026/05/22 09:32:40 [Бизнес-Логика] Успешно обработано сообщение Key=093238
+2026/05/22 09:32:42 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=093232 -> Топик=local-events-retry
+2026/05/22 09:32:45 [Бизнес-Логика] Успешно обработано сообщение Key=093232
+2026/05/22 09:32:49 [Основной-Воркер-1] Ошибка сообщения 093241: unrecoverable validation error (e.g. bad JSON): bad JSON structure
+2026/05/22 09:32:49 [Outbox] Фатальная ошибка. Регистрация 093241 в Outbox -> DLQ
+2026/05/22 09:32:49 [Бизнес-Логика] Успешно обработано сообщение Key=093244
+2026/05/22 09:32:49 [Бизнес-Логика] Успешно обработано сообщение Key=093247
+2026/05/22 09:32:51 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=093241 -> Топик=local-events-dlq
 ```
 ## Быстрый запуск
 ```bash

@@ -219,6 +219,35 @@ func main() {
 	}
 
 	log.Println("[Пайплайн] Все консьюмеры (Основной + Retry) успешно запущены.")
+
+		// --- СИМУЛЯЦИЯ ЖИВОГО ТРАФИКА (Генератор кликов) ---
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				uniqueKey := time.Now().Format("150405") // ID в формате ЧЧММСС
+				
+				// Отправляем тестовое событие клика в основной топик
+				err := dlqProducer.WriteMessages(ctx, kafka.Message{
+					Topic: mainTopic,
+					Key:   []byte(uniqueKey),
+					Value: []byte("user_click_action"),
+				})
+				if err != nil {
+					log.Printf("[Симулятор] Ошибка отправки события: %v", err)
+				}
+			}
+		}
+	}()
+
+	// Эта строка у вас уже есть, она должна быть самой последней в main():
+	<-ctx.Done()
+
+
 	<-ctx.Done()
 	log.Println("Завершение работы приложения...")
 }
