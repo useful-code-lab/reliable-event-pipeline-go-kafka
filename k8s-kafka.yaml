@@ -49,7 +49,76 @@ spec:
       port: 9092
       targetPort: 9092
 ---
-# Добавляем сюда наше Go-приложение
+# ИНФРАСТРУКТУРА: PostgreSQL
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_USER
+          value: "user"
+        - name: POSTGRES_PASSWORD
+          value: "password"
+        - name: POSTGRES_DB
+          value: "app_db"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+---
+# ИНФРАСТРУКТУРА: Redis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+---
+# НАШЕ GO-ПРИЛОЖЕНИЕ
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -64,13 +133,26 @@ spec:
       labels:
         app: go-kafka-app
     spec:
-      # Ждем, пока Кафка начнет принимать сетевые соединения на порту 9092
+      # Ждем готовности всех инфраструктурных сервисов перед стартом
       initContainers:
-      - name: wait-for-kafka
+      - name: wait-for-infra
         image: busybox:latest
-        command: ['sh', '-c', 'until nc -zvw1 kafka-service 9092; do echo "Ожидание запуска Kafka..."; sleep 2; done;']
+        command: ['sh', '-c', 'until nc -zvw1 kafka-service 9092 && nc -zvw1 postgres-service 5432 && nc -zvw1 redis-service 6379; do echo "Ожидание запуска инфраструктуры..."; sleep 2; done;']
       
       containers:
       - name: app
         image: kafka-pipeline-go:local
         imagePullPolicy: Never
+        env:
+        - name: KAFKA_BROKERS
+          value: "kafka-service:9092"
+        - name: KAFKA_TOPIC
+          value: "local-events"
+        - name: KAFKA_DLQ_TOPIC
+          value: "local-events-dlq"
+        - name: KAFKA_GROUP_ID
+          value: "local-processor-group"
+        - name: DATABASE_URL
+          value: "postgres://user:password@postgres-service:5432/app_db?sslmode=disable"
+        - name: REDIS_URL
+          value: "redis-service:6379"

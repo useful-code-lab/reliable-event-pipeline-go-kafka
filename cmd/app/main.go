@@ -2,76 +2,151 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	mykafka "kafka-pipeline-go/internal/kafka"
 
+	// Регистрация драйвера pgx для database/sql
+	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 )
 
 func main() {
-	// Основная конфигурация для чтения и отправки обычных событий
+	// 1. Инициализация конфигурации
+	kafkaBrokers := getEnv("KAFKA_BROKERS", "kafka-service:9092")
 	cfg := mykafka.Config{
-		Brokers: []string{"kafka-service:9092"},
-		Topic:   "local-events",
-		GroupID: "local-processor-group",
+		Brokers: []string{kafkaBrokers},
+		Topic:   getEnv("KAFKA_TOPIC", "local-events"),
+		GroupID: getEnv("KAFKA_GROUP_ID", "local-processor-group"),
 		UseTLS:  false,
 	}
-
-	// Отдельная конфигурация для топика-отстойника (DLQ)
 	dlqCfg := mykafka.Config{
 		Brokers: cfg.Brokers,
-		Topic:   "local-events-dlq", // Имя топика для проблемных сообщений
+		Topic:   getEnv("KAFKA_DLQ_TOPIC", "local-events-dlq"),
 		UseTLS:  cfg.UseTLS,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Инициализируем компоненты
+	// 2. Отказоустойчивое подключение к PostgreSQL через pgx драйвер (до 5 попыток)
+	var dbPool *sql.DB
+	var err error
+	for i := 1; i <= 5; i++ {
+		log.Printf("Попытка подключения к PostgreSQL (%d/5)...", i)
+		dbPool, err = sql.Open("pgx", getEnv("DATABASE_URL", "postgres://user:password@localhost:5432/app_db?sslmode=disable"))
+		if err == nil {
+			// Проверяем, готова ли база принимать запросы
+			if err = dbPool.PingContext(ctx); err == nil {
+				log.Println("Успешно подключено к PostgreSQL.")
+				break
+			}
+		}
+		if i == 5 {
+			log.Fatalf("Не удалось подключиться к PostgreSQL после 5 попыток: %v", err)
+		}
+		time.Sleep(3 * time.Second) // Даем время СУБД на инициализацию
+	}
+	defer dbPool.Close()
+
+	// Инициализация таблицы в БД
+	if err := initDatabaseSchema(dbPool); err != nil {
+		log.Fatalf("Ошибка инициализации БД: %v", err)
+	}
+
+	// 3. Отказоустойчивое подключение к Redis (до 5 попыток)
+	var rdb *redis.Client
+	for i := 1; i <= 5; i++ {
+		log.Printf("Попытка подключения к Redis (%d/5)...", i)
+		rdb = redis.NewClient(&redis.Options{
+			Addr: getEnv("REDIS_URL", "localhost:6379"),
+		})
+		if err = rdb.Ping(ctx).Err(); err == nil {
+			log.Println("Успешно подключено к Redis.")
+			break
+		}
+		if i == 5 {
+			log.Fatalf("Не удалось подключиться к Redis после 5 попыток: %v", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	defer rdb.Close()
+
+	// 4. Инициализация компонентов Kafka
 	producer := mykafka.NewProducer(cfg)
-	dlqProducer := mykafka.NewProducer(dlqCfg) // Продюсер для отправки ошибок
+	dlqProducer := mykafka.NewProducer(dlqCfg)
 	consumer := mykafka.NewConsumer(cfg)
 
 	defer func() {
-		if err := producer.Close(); err != nil {
-			log.Printf("Ошибка закрытия продюсера: %v", err)
-		}
-		if err := dlqProducer.Close(); err != nil {
-			log.Printf("Ошибка закрытия DLQ-продюсера: %v", err)
-		}
-		if err := consumer.Close(); err != nil {
-			log.Printf("Ошибка закрытия консьюмера: %v", err)
-		}
+		_ = producer.Close()
+		_ = dlqProducer.Close()
+		_ = consumer.Close()
 		log.Println("Соединения с Kafka успешно закрыты.")
 	}()
 
-	// Счетчик для имитации периодической ошибки
 	var messageCounter int
+	var counterMu sync.Mutex
 
-	// Наша чистая бизнес-логика
+	// 5. Описание бизнес-логики (Handler) с интеграцией Postgres и Redis
 	eventHandler := func(ctx context.Context, msg kafka.Message) error {
-		messageCounter++
+		messageID := string(msg.Key)
 
-		// Имитируем бизнес-ошибку: каждое 3-е сообщение будет признано "бракованным"
-		if messageCounter%3 == 0 {
-			return errors.New("ошибка валидации данных: поврежденный формат JSON")
+		// --- ШАГ А: Дедупликация через Redis (Идемпотентность) ---
+		isNew, err := rdb.SetNX(ctx, "processed_msg:"+messageID, true, 24*time.Hour).Result()
+		if err != nil {
+			log.Printf("[Redis] Ошибка проверки кэша: %v. Пропускаем дедупликацию ради надежности.", err)
+		} else if !isNew {
+			log.Printf("[Идемпотентность/Redis] Сообщение %s уже обрабатывалось ранее. Пропускаем дубликат.", messageID)
+			return nil
 		}
 
-		log.Printf("Успешно обработано воркером: Ключ=%s, Значение=%s", string(msg.Key), string(msg.Value))
+		// Имитация случайных ошибок бизнес-логики для демонстрации DLQ
+		counterMu.Lock()
+		messageCounter++
+		isErrorIteration := messageCounter%3 == 0
+		counterMu.Unlock()
+
+		if isErrorIteration {
+			_ = rdb.Del(ctx, "processed_msg:"+messageID).Err()
+			return errors.New("ошибка валидации: поврежденный JSON")
+		}
+
+		// --- ШАГ Б: Запись бизнес-данных в PostgreSQL в транзакции ---
+		tx, err := dbPool.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		_, err = tx.ExecContext(ctx, "INSERT INTO events (msg_key, msg_value, processed_at) VALUES ($1, $2, $3)", messageID, string(msg.Value), time.Now())
+		if err != nil {
+			_ = rdb.Del(ctx, "processed_msg:"+messageID).Err()
+			return err
+		}
+
+		if err := tx.Commit(); err != nil {
+			_ = rdb.Del(ctx, "processed_msg:"+messageID).Err()
+			return err
+		}
+
+		log.Printf("[Бизнес-Логика] Данные успешно сохранены в Postgres. Ключ=%s", messageID)
 		return nil
 	}
 
-	// Запускаем консьюмер, применяя Middleware обертку WithDLQ к нашему eventHandler
-	log.Println("Запуск пула консьюмеров с поддержкой DLQ...")
+	// Запуск пула консьюмеров с Middleware DLQ
+	log.Println("Запуск пайплайна [Kafka + Postgres + Redis]...")
 	go consumer.Start(ctx, 3, WithDLQ(dlqProducer, eventHandler))
 
-	// Тестовая отправка сообщения каждые 3 секунды
+	// Имитация генератора событий (Отправка уникальных ключей на базе таймстемпа)
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
@@ -80,11 +155,10 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				err := producer.SendMessage(ctx, []byte("user_1"), []byte("click_event"))
+				uniqueKey := time.Now().Format("150405") // Генерация уникального ID (ЧЧММСС)
+				err := producer.SendMessage(ctx, []byte(uniqueKey), []byte("user_click_action"))
 				if err != nil {
-					log.Printf("Не удалось отправить сообщение: %v", err)
-				} else {
-					log.Println("Сообщение успешно отправлено в топик.")
+					log.Printf("Ошибка отправки: %v", err)
 				}
 			}
 		}
@@ -95,31 +169,43 @@ func main() {
 	time.Sleep(1 * time.Second)
 }
 
-// WithDLQ — функция-декоратор (Middleware). Она перехватывает ошибки вашей бизнес-логики.
+func initDatabaseSchema(db *sql.DB) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS events (
+		id SERIAL PRIMARY KEY,
+		msg_key VARCHAR(50) NOT NULL,
+		msg_value TEXT NOT NULL,
+		processed_at TIMESTAMP NOT NULL
+	);`
+	_, err := db.Exec(query)
+	return err
+}
+
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
+}
+
 func WithDLQ(dlqProducer *mykafka.Producer, next mykafka.MessageHandler) mykafka.MessageHandler {
 	return func(ctx context.Context, msg kafka.Message) error {
-		// Передаем сообщение в реальную бизнес-логику
 		err := next(ctx, msg)
 		if err == nil {
-			return nil // Если всё обработалось без ошибок, просто выходим
+			return nil
 		}
 
-		// Если бизнес-логика вернула ошибку, изолируем сообщение
-		log.Printf("[DLQ Middleware] Перехват ошибки: %v. Эвакуация сообщения в отстойник...", err)
+		log.Printf("[DLQ Middleware] Эвакуация сообщения %s в отстойник из-за ошибки: %v", string(msg.Key), err)
 
 		dlqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		// Пересылаем исходное сообщение в топик ошибок
-		dlqErr := dlqProducer.SendMessage(dlqCtx, msg.Key, msg.Value)
-		if dlqErr != nil {
-			// Если упала сама Кафка и отправить в DLQ не удалось, возвращаем ошибку наружу.
-			// Консьюмер НЕ закомитит это сообщение, чтобы мы не потеряли данные.
-			log.Printf("[DLQ Middleware] КРИТИЧЕСКАЯ ОШИБКА: не удалось записать в DLQ топик: %v", dlqErr)
+		if dlqErr := dlqProducer.SendMessage(dlqCtx, msg.Key, msg.Value); dlqErr != nil {
+			log.Printf("[DLQ] КРИТИЧЕСКАЯ ОШИБКА записи в DLQ: %v", dlqErr)
 			return err
 		}
 
-		log.Println("[DLQ Middleware] Сообщение успешно изолировано. Конвейер продолжает работу.")
-		return nil // Возвращаем nil, чтобы консьюмер сделал Commit и перешел к следующему сообщению
+		log.Println("[DLQ] Сообщение успешно изолировано.")
+		return nil
 	}
 }
