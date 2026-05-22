@@ -103,6 +103,10 @@ func main() {
 	var messageCounter int
 	var counterMu sync.Mutex
 
+	// Запуск фонового процесса Outbox Worker (Паттерн 6)
+	// Передаем контекст, пул БД и продюсер для отправки в Kafka
+	go startOutboxWorker(ctx, dbPool, retryProducer)
+
 	// Функция бизнес-обработки
 	executeBusinessLogic := func(ctx context.Context, msg kafka.Message) error {
 		messageID := string(msg.Key)
@@ -155,25 +159,25 @@ func main() {
 		if procErr != nil {
 			log.Printf("[%s] Ошибка сообщения %s: %v", workerTag, string(msg.Key), procErr)
 
-			// Ошибка фатальная? -> Сразу в DLQ
-			if errors.Is(procErr, ErrFatalValidation) {
-				log.Printf("[Роутер] Фатальный сбой. Отправка %s в DLQ", string(msg.Key))
-				_ = sendToKafkaTopic(ctx, dlqProducer, dlqTopic, msg)
-			} else {
-				// Ошибка временная -> Паттерн 2 (Non-blocking Retry)
-				attempts := getRetryAttempts(msg) + 1
-				if attempts > 3 {
-					log.Printf("[Роутер] Превышен лимит ретраев (3/3) для %s. Перенос в DLQ.", string(msg.Key))
-					_ = sendToKafkaTopic(ctx, dlqProducer, dlqTopic, msg)
-				} else {
-					// Экспоненциальная задержка Backoff перед отправкой в топик ретраев [1]
-					backoffDuration := time.Duration(attempts) * 2 * time.Second
-					log.Printf("[Роутер] Временная ошибка. Отправка %s в Retry-топик (Попытка %d/3). Задержка: %v", string(msg.Key), attempts, backoffDuration)
+			targetTopic := retryTopic
+			attempts := getRetryAttempts(msg) + 1
 
-					time.Sleep(backoffDuration)
-					msg.Headers = append(msg.Headers, kafka.Header{Key: "x-retry-attempts", Value: []byte(strconv.Itoa(attempts))})
-					_ = sendToKafkaTopic(ctx, retryProducer, retryTopic, msg)
-				}
+			if errors.Is(procErr, ErrFatalValidation) {
+				targetTopic = dlqTopic
+				log.Printf("[Outbox] Фатальная ошибка. Регистрация %s в Outbox -> DLQ", string(msg.Key))
+			} else if attempts > 3 {
+				targetTopic = dlqTopic
+				log.Printf("[Outbox] Исчерпан лимит ретраев. Регистрация %s в Outbox -> DLQ", string(msg.Key))
+			} else {
+				log.Printf("[Outbox] Временная ошибка. Регистрация %s в Outbox -> Retry (Попытка %d)", string(msg.Key), attempts)
+				msg.Headers = append(msg.Headers, kafka.Header{Key: "x-retry-attempts", Value: []byte(strconv.Itoa(attempts))})
+			}
+
+			// ПАТТЕРН OUTBOX: Вместо прямой отправки в сеть, пишем задачу в БД
+			// Это гарантирует, что если приложение упадет прямо сейчас, данные не потеряются
+			err := writeToOutbox(dbPool, targetTopic, msg)
+			if err != nil {
+				log.Printf("[Критический сбой Outbox] Не удалось записать ошибку в БД: %v", err)
 			}
 		}
 
@@ -262,8 +266,82 @@ func getRetryAttempts(msg kafka.Message) int {
 }
 
 func initDatabaseSchema(db *sql.DB) error {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS events (id BIGSERIAL PRIMARY KEY, msg_key VARCHAR(50) NOT NULL UNIQUE, msg_value TEXT NOT NULL, processed_at TIMESTAMP NOT NULL);`)
+	// 1. Создание основной таблицы бизнес-событий
+	_, _ = db.Exec(`
+	CREATE TABLE IF NOT EXISTS events (
+		id BIGSERIAL PRIMARY KEY,
+		msg_key VARCHAR(50) NOT NULL UNIQUE,
+		msg_value TEXT NOT NULL,
+		processed_at TIMESTAMP NOT NULL
+	);`)
+
+	// 2. Создание сервисной таблицы для паттерна Transactional Outbox
+	_, err := db.Exec(`
+	CREATE TABLE IF NOT EXISTS kafka_outbox (
+		id BIGSERIAL PRIMARY KEY,
+		target_topic VARCHAR(100) NOT NULL,
+		msg_key TEXT NOT NULL,
+		msg_value TEXT NOT NULL
+	);`)
 	return err
+}
+
+// Функция записи сообщения в таблицу Outbox
+func writeToOutbox(db *sql.DB, topic string, msg kafka.Message) error {
+	_, err := db.Exec(`
+		INSERT INTO kafka_outbox (target_topic, msg_key, msg_value) 
+		VALUES ($1, $2, $3)`,
+		topic, string(msg.Key), string(msg.Value),
+	)
+	return err
+}
+
+// Фоновый воркер, который раз в секунду переносит сообщения из БД в Kafka
+func startOutboxWorker(ctx context.Context, db *sql.DB, producer *kafka.Writer) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Читаем пачку из 10 старых неотправленных сообщений
+			rows, err := db.QueryContext(ctx, "SELECT id, target_topic, msg_key, msg_value FROM kafka_outbox ORDER BY id ASC LIMIT 10")
+			if err != nil {
+				continue
+			}
+
+			type outboxItem struct {
+				id              int64
+				topic, key, val string
+			}
+			var items []outboxItem
+
+			for rows.Next() {
+				var item outboxItem
+				if err := rows.Scan(&item.id, &item.topic, &item.key, &item.val); err == nil {
+					items = append(items, item)
+				}
+			}
+			rows.Close()
+
+			// Отправляем сообщения в Kafka и удаляем их из БД только при успешной отправке
+			for _, item := range items {
+				err := producer.WriteMessages(ctx, kafka.Message{
+					Topic: item.topic,
+					Key:   []byte(item.key),
+					Value: []byte(item.val),
+				})
+				if err == nil {
+					_, _ = db.ExecContext(ctx, "DELETE FROM kafka_outbox WHERE id = $1", item.id)
+					log.Printf("[Outbox-Worker] Успешно перенесено в Kafka: Ключ=%s -> Топик=%s", item.key, item.topic)
+				} else {
+					log.Printf("[Outbox-Worker] Ошибка отправки в Kafka для ID %d: %v", item.id, err)
+				}
+			}
+		}
+	}
 }
 
 func getEnv(key, fallback string) string {

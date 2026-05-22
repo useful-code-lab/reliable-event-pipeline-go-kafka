@@ -78,23 +78,31 @@ kubectl delete -f k8s-kafka.yaml
 
 ## Пример выводимого сообщения 
 ```bash
-ROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
-2026/05/22 09:12:33 [Роутер] Временная ошибка. Отправка 090616 в Retry-топик (Попытка 1/3). Задержка: 2s
-2026/05/22 09:12:33 [Основной-Воркер-2] Ошибка сообщения 090613: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
-2026/05/22 09:12:33 [Роутер] Временная ошибка. Отправка 090613 в Retry-топик (Попытка 1/3). Задержка: 2s
-2026/05/22 09:12:36 [Основной-Воркер-1] Ошибка сообщения 090619: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
-2026/05/22 09:12:36 [Роутер] Временная ошибка. Отправка 090619 в Retry-топик (Попытка 1/3). Задержка: 2s
-2026/05/22 09:12:36 [Основной-Воркер-2] Ошибка сообщения 090622: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
-2026/05/22 09:12:36 [Роутер] Временная ошибка. Отправка 090622 в Retry-топик (Попытка 1/3). Задержка: 2s
-2026/05/22 09:12:39 [Основной-Воркер-1] Ошибка сообщения 090625: unrecoverable validation error (e.g. bad JSON): bad JSON structure
-2026/05/22 09:12:39 [Роутер] Фатальный сбой. Отправка 090625 в DLQ
-2026/05/22 09:12:39 [Основной-Воркер-2] Ошибка сообщения 090628: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
-2026/05/22 09:12:39 [Роутер] Временная ошибка. Отправка 090628 в Retry-топик (Попытка 1/3). Задержка: 2s
-2026/05/22 09:12:39 [Retry-Воркер-2] Ошибка сообщения 090616: transient infrastructure error (e.g. DB timeout): database connection timeout
-2026/05/22 09:12:39 [Роутер] Временная ошибка. Отправка 090616 в Retry-топик (Попытка 2/3). Задержка: 4s
-2026/05/22 09:12:39 [Retry-Воркер-1] Ошибка сообщения 090613: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
-2026/05/22 09:12:39 [Роутер] Временная ошибка. Отправка 090613 в Retry-топик (Попытка 2/3). Задержка: 4s
-2026/05/22 09:12:40 [Основной-Воркер-1] Ошибка сообщения 090631: transient infrastructure error (e.g. DB time
+2026/05/22 09:23:38 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091122 -> Топик=local-events-dlq
+2026/05/22 09:23:39 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091131 -> Топик=local-events-retry
+2026/05/22 09:23:40 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=090846 -> Топик=local-events-retry
+2026/05/22 09:23:41 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=090849 -> Топик=local-events-retry
+2026/05/22 09:23:42 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=090725 -> Топик=local-events-retry
+2026/05/22 09:23:43 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091149 -> Топик=local-events-dlq
+2026/05/22 09:23:44 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091152 -> Топик=local-events-retry
+2026/05/22 09:23:45 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091201 -> Топик=local-events-retry
+2026/05/22 09:23:45 [Retry-Воркер-1] Ошибка сообщения 091131: unrecoverable validation error (e.g. bad JSON): bad JSON structure
+2026/05/22 09:23:45 [Outbox] Фатальная ошибка. Регистрация 091131 в Outbox -> DLQ
+2026/05/22 09:23:45 [Retry-Воркер-2] Ошибка сообщения 090837: transient infrastructure error (e.g. DB timeout): database connection timeout
+2026/05/22 09:23:45 [Outbox] Временная ошибка. Регистрация 090837 в Outbox -> Retry (Попытка 1)
+2026/05/22 09:23:45 [Retry-Воркер-1] Ошибка сообщения 090846: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
+2026/05/22 09:23:45 [Outbox] Временная ошибка. Регистрация 090846 в Outbox -> Retry (Попытка 1)
+2026/05/22 09:23:45 [Retry-Воркер-2] Ошибка сообщения 090849: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
+2026/05/22 09:23:45 [Outbox] Временная ошибка. Регистрация 090849 в Outbox -> Retry (Попытка 1)
+2026/05/22 09:23:45 [Retry-Воркер-1] Ошибка сообщения 090725: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
+2026/05/22 09:23:45 [Outbox] Временная ошибка. Регистрация 090725 в Outbox -> Retry (Попытка 1)
+2026/05/22 09:23:45 [Retry-Воркер-2] Ошибка сообщения 091152: transient infrastructure error (e.g. DB timeout): db fail: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification (SQLSTATE 42P10)
+2026/05/22 09:23:45 [Outbox] Временная ошибка. Регистрация 091152 в Outbox -> Retry (Попытка 1)
+2026/05/22 09:23:45 [Retry-Воркер-1] Ошибка сообщения 091201: unrecoverable validation error (e.g. bad JSON): bad JSON structure
+2026/05/22 09:23:45 [Outbox] Фатальная ошибка. Регистрация 091201 в Outbox -> DLQ
+2026/05/22 09:23:46 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=090858 -> Топик=local-events-retry
+2026/05/22 09:23:47 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091204 -> Топик=local-events-retry
+2026/05/22 09:23:48 [Outbox-Worker] Успешно перенесено в Kafka: Ключ=091210 -> Топик=local-events-dlq
 ```
 ## Быстрый запуск
 ```bash
