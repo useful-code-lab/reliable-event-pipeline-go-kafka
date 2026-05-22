@@ -10,14 +10,12 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// MessageHandler — функция-обработчик, которую мы будем передавать из бизнес-логики
 type MessageHandler func(ctx context.Context, msg kafka.Message) error
 
 type Consumer struct {
 	reader *kafka.Reader
 }
 
-// NewConsumer создает новый объект для чтения сообщений
 func NewConsumer(cfg Config) *Consumer {
 	return &Consumer{
 		reader: kafka.NewReader(kafka.ReaderConfig{
@@ -25,26 +23,24 @@ func NewConsumer(cfg Config) *Consumer {
 			GroupID:        cfg.GroupID,
 			Topic:          cfg.Topic,
 			Dialer:         NewDialer(cfg),
-			MinBytes:       10e3, // 10KB
-			MaxBytes:       10e6, // 10MB
-			CommitInterval: 0,    // Отключаем авто-коммит для ручного подтверждения
-			StartOffset:    kafka.LastOffset,
+			MinBytes:       1,                 // ВАЖНО: 1 байт, чтобы читать сообщения мгновенно
+			MaxBytes:       10e6,              // 10MB лимит на пакет
+			CommitInterval: 0,                 // Ручной коммит
+			StartOffset:    kafka.FirstOffset, // Читаем топик с самого начала
 		}),
 	}
 }
 
-// Start запускает указанное количество воркеров для параллельной обработки
+
 func (c *Consumer) Start(ctx context.Context, workersCount int, handler MessageHandler) {
 	var wg sync.WaitGroup
 	msgChan := make(chan kafka.Message, workersCount)
 
-	// 1. Запуск пула воркеров
 	for i := 0; i < workersCount; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			for msg := range msgChan {
-				// Ограничиваем время обработки одного сообщения
 				processCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 				err := handler(processCtx, msg)
 				cancel()
@@ -54,7 +50,6 @@ func (c *Consumer) Start(ctx context.Context, workersCount int, handler MessageH
 					continue
 				}
 
-				// Коммитим (подтверждаем) сообщение только при успешной обработке
 				if err := c.reader.CommitMessages(ctx, msg); err != nil {
 					log.Printf("[Воркер %d] Ошибка коммита: %v", workerID, err)
 				}
@@ -62,7 +57,6 @@ func (c *Consumer) Start(ctx context.Context, workersCount int, handler MessageH
 		}(i)
 	}
 
-	// 2. Поток чтения из Kafka и передача сообщений в канал воркеров
 	go func() {
 		defer close(msgChan)
 		for {
@@ -72,7 +66,7 @@ func (c *Consumer) Start(ctx context.Context, workersCount int, handler MessageH
 					return
 				}
 				log.Printf("Ошибка получения сообщения: %v", err)
-				time.Sleep(time.Second) // Защита от спама при сетевых сбоях
+				time.Sleep(time.Second)
 				continue
 			}
 			msgChan <- msg
@@ -82,7 +76,6 @@ func (c *Consumer) Start(ctx context.Context, workersCount int, handler MessageH
 	wg.Wait()
 }
 
-// Close закрывает соединение консьюмера
 func (c *Consumer) Close() error {
 	return c.reader.Close()
 }
